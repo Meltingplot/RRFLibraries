@@ -235,6 +235,9 @@ struct LockRecord
 void ReadWriteLock::LockForReading() noexcept
 {
 	TaskBase *_ecv_from const me = not_null(TaskBase::GetCallerTaskHandle());
+
+	// Get the lock record before suspending the scheduler, because malloc doesn't take the malloc mutex while the scheduler is suspended
+	LockRecord *const lr = new LockRecord(nullptr, me);
 	RTOSIface::EnterTaskCriticalSection();
 
 	// If we own the write lock, ignore the read lock request
@@ -243,6 +246,7 @@ void ReadWriteLock::LockForReading() noexcept
 		if (wl != nullptr && wl->owner == me)
 		{
 			RTOSIface::LeaveTaskCriticalSection();
+			delete lr;
 			return;
 		}
 	}
@@ -254,12 +258,13 @@ void ReadWriteLock::LockForReading() noexcept
 		{
 			++rl->count;
 			RTOSIface::LeaveTaskCriticalSection();
+			delete lr;
 			return;
 		}
 	}
 
-	// We don't already own a read lock, so we need a new lock record
-	LockRecord *const lr = new LockRecord(readLocks, me);
+	// We don't already own a read lock, so we need the new lock record
+	lr->next = readLocks;
 	readLocks = lr;
 
 	// If nobody owns or is trying to acquire write lock, we can read lock
@@ -281,6 +286,9 @@ void ReadWriteLock::LockForReading() noexcept
 bool ReadWriteLock::ConditionalLockForReading() noexcept
 {
 	TaskBase *_ecv_from const me = not_null(TaskBase::GetCallerTaskHandle());
+
+	// Get the lock record before suspending the scheduler, because malloc doesn't take the malloc mutex while the scheduler is suspended
+	LockRecord *const lr = new LockRecord(nullptr, me);
 	RTOSIface::EnterTaskCriticalSection();
 
 	// If we own the write lock, ignore the read lock request
@@ -289,6 +297,7 @@ bool ReadWriteLock::ConditionalLockForReading() noexcept
 		if (wl != nullptr && wl->owner == me)
 		{
 			RTOSIface::LeaveTaskCriticalSection();
+			delete lr;
 			return true;
 		}
 	}
@@ -300,16 +309,17 @@ bool ReadWriteLock::ConditionalLockForReading() noexcept
 		{
 			++readOwner->count;
 			RTOSIface::LeaveTaskCriticalSection();
+			delete lr;
 			return true;
 		}
 	}
 
-	// We don't already own a read lock, so we need a new lock record
+	// We don't already own a read lock, so we need the new lock record
 
 	// If nobody owns or is trying to acquire write lock, we can read lock
 	if (writeLocks == nullptr)
 	{
-		LockRecord *const lr = new LockRecord(readLocks, me);
+		lr->next = readLocks;
 		readLocks = lr;
 		++lr->count;
 		RTOSIface::LeaveTaskCriticalSection();
@@ -317,6 +327,7 @@ bool ReadWriteLock::ConditionalLockForReading() noexcept
 	}
 
 	RTOSIface::LeaveTaskCriticalSection();
+	delete lr;
 	return false;
 }
 
@@ -388,6 +399,9 @@ void ReadWriteLock::ReleaseReader() noexcept
 void ReadWriteLock::LockForWriting() noexcept
 {
 	TaskBase *_ecv_from const me = not_null(TaskBase::GetCallerTaskHandle());
+
+	// Get the lock record before suspending the scheduler, because malloc doesn't take the malloc mutex while the scheduler is suspended
+	LockRecord *const newLock = new LockRecord(nullptr, me);
 	RTOSIface::EnterTaskCriticalSection();
 
 	LockRecord *_ecv_null wr = writeLocks;
@@ -396,11 +410,11 @@ void ReadWriteLock::LockForWriting() noexcept
 		RTOS_ASSERT(wr->count != 0);
 		++wr->count;
 		RTOSIface::LeaveTaskCriticalSection();
+		delete newLock;
 		return;
 	}
 
-	// We need a new lock record
-	LockRecord *newLock = new LockRecord(nullptr, me);
+	// We need the new lock record
 	if (wr == nullptr)
 	{
 		// Nobody else is waiting for the write lock, so make the write lock list point to our lock record
@@ -437,12 +451,14 @@ void ReadWriteLock::LockForWriting() noexcept
 bool ReadWriteLock::ConditionalLockForWriting() noexcept
 {
 	TaskBase *_ecv_from const me = not_null(TaskBase::GetCallerTaskHandle());
+
+	// Get the lock record before suspending the scheduler, because malloc doesn't take the malloc mutex while the scheduler is suspended
+	LockRecord *const newLock = new LockRecord(nullptr, me);
 	RTOSIface::EnterTaskCriticalSection();
 
 	if (writeLocks == nullptr && readLocks == nullptr)
 	{
 		// Nobody else is waiting for the write lock and there are no read locks
-		LockRecord *newLock = new LockRecord(nullptr, me);
 		writeLocks = newLock;
 		++newLock->count;
 		RTOSIface::LeaveTaskCriticalSection();
@@ -450,6 +466,7 @@ bool ReadWriteLock::ConditionalLockForWriting() noexcept
 	}
 
 	RTOSIface::LeaveTaskCriticalSection();
+	delete newLock;
 	return false;
 }
 
