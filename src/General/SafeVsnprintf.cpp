@@ -322,7 +322,7 @@ bool FormattedPrinter::PrintLL(long long i) noexcept
 	if ((flags.u.b.isSigned) && (flags.base == 10) && (i < 0LL))
 	{
 		neg = true;
-		u = -i;
+		u = -u;															// negate the unsigned value: -i overflows for LLONG_MIN
 	}
 
 	char print_buf[MaxUllOctalDigits + 2];
@@ -365,7 +365,7 @@ bool FormattedPrinter::PrintI(int i) noexcept
 	if ((flags.u.b.isSigned) && (base == 10) && (i < 0))
 	{
 		neg = true;
-		u = -i;
+		u = -u;															// negate the unsigned value: -i overflows for INT_MIN
 	}
 
 	char print_buf[MaxLongDigits + 2];
