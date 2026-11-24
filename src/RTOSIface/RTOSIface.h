@@ -175,7 +175,7 @@ public:
 	// This is used by the CAN subsystem, so that we can use 8-bit task IDs to identify a sending task, instead of needing to use 32-bits.
 	typedef uint32_t TaskId;
 
-	TaskBase() noexcept : next(nullptr), taskId(0) { }
+	TaskBase() noexcept : next(nullptr), taskId(0), writeLocksHeld(0) { }
 	~TaskBase() noexcept { TerminateAndUnlink(); }
 
 	// Get the short-form task ID. This is a small number, used to send a task ID in 1 byte or less i a CAN packet. It is guaranteed not to be zero.
@@ -240,6 +240,9 @@ public:
 
 	static TaskId GetCallerTaskId() noexcept { return _ecv_not_null(GetCallerTaskHandle())->taskId; }
 
+	// Return the number of write locks on ReadWriteLock objects that the calling task holds, nested ones included
+	static unsigned int GetCallerWriteLocksHeld() noexcept { return _ecv_not_null(GetCallerTaskHandle())->writeLocksHeld; }
+
 	static void Yield() noexcept { taskYIELD(); }
 
 	TaskBase(const TaskBase&) = delete;				// it's not safe to copy these
@@ -252,8 +255,11 @@ public:
 	static constexpr uint32_t TimeoutUnlimited = 0xFFFFFFFFu;
 
 protected:
+	friend class ReadWriteLock;
+
 	TaskBase *_ecv_from _ecv_null next;
 	TaskId taskId;
+	unsigned int writeLocksHeld;					// write locks on ReadWriteLock objects that this task holds, nested ones included. Only the task itself changes it.
 
 	static TaskBase *_ecv_from _ecv_null taskList;
 	static TaskId numTasks;

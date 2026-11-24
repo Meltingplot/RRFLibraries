@@ -409,6 +409,7 @@ void ReadWriteLock::LockForWriting() noexcept
 	{
 		RTOS_ASSERT(wr->count != 0);
 		++wr->count;
+		++me->writeLocksHeld;
 		RTOSIface::LeaveTaskCriticalSection();
 		delete newLock;
 		return;
@@ -424,6 +425,7 @@ void ReadWriteLock::LockForWriting() noexcept
 		if (readLocks == nullptr)
 		{
 			++newLock->count;
+			++me->writeLocksHeld;
 			RTOSIface::LeaveTaskCriticalSection();
 			return;
 		}
@@ -446,6 +448,7 @@ void ReadWriteLock::LockForWriting() noexcept
 		TaskBase::TakeIndexed(NotifyIndices::ReadWriteLocker);
 	}
 	while (newLock->count == 0);
+	++me->writeLocksHeld;
 }
 
 bool ReadWriteLock::ConditionalLockForWriting() noexcept
@@ -461,6 +464,7 @@ bool ReadWriteLock::ConditionalLockForWriting() noexcept
 		// Nobody else is waiting for the write lock and there are no read locks
 		writeLocks = newLock;
 		++newLock->count;
+		++me->writeLocksHeld;
 		RTOSIface::LeaveTaskCriticalSection();
 		return true;
 	}
@@ -477,6 +481,7 @@ void ReadWriteLock::ReleaseWriter() noexcept
 
 	LockRecord *_ecv_null wl = writeLocks;
 	RTOS_ASSERT(wl != nullptr && wl->owner == me && wl->count != 0);
+	--me->writeLocksHeld;
 	if (--wl->count == 0)
 	{
 		LockRecord *_ecv_null wl2 = wl->next;
@@ -511,6 +516,7 @@ void ReadWriteLock::DowngradeWriter() noexcept
 	RTOSIface::EnterTaskCriticalSection();
 	LockRecord *_ecv_null const wl = writeLocks;
 	RTOS_ASSERT(wl != nullptr && wl->owner == me && wl->count == 1);
+	--me->writeLocksHeld;
 	writeLocks = wl->next;
 	wl->next = readLocks;
 	readLocks = wl;
