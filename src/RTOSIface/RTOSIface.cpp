@@ -216,6 +216,26 @@ void TaskBase::GiveFromISR(uint32_t index) noexcept
 // Each element in the readLocks list is a lock if the count is nonzero or a request to read lock if the count is zero
 // Each element in the writeLocks list is a lock if the count is nonzero or a request to write lock if the count is zero
 // Only the head element in the writeLocks list can have a nonzero count
+//
+// Lock records come from a free list. When it is empty a record has to be allocated, which calls malloc. This must not happen inside the
+// task critical section, for the following reason.
+// malloc and free are protected by a mutex of their own, see GetMallocMutex in the firmware. A mutex cannot be waited for while the scheduler
+// is suspended, so GetMallocMutex does not take it in that state. An allocation made inside the critical section is therefore unprotected:
+// 1. A low priority task, e.g. Main creating a heater while it executes config.g, is inside malloc and holds the malloc mutex.
+// 2. A higher priority task, e.g. Heat, preempts it and acquires a read lock for which it needs a new lock record.
+// 3. The free list is empty because more records are in use than ever before, so the record has to be allocated.
+// 4. If that allocation is made inside the critical section, malloc runs without the mutex while the first task is halfway through changing
+//    the heap, and the heap gets corrupted.
+// NewLockRecord therefore leaves the critical section before it allocates and enters it again afterwards. With the scheduler running, malloc
+// takes its mutex as usual: if nobody else is inside malloc it returns at once, otherwise this task waits on the mutex until the other task
+// has left malloc. Taking a record from the free list, which is the normal case, is done without leaving the critical section.
+// Because the critical section may have been left, the lock functions must always allow for that. When changing them, keep to these rules:
+// - A record is added to and removed from the lists only by the task that owns it. Checks about the caller's own records made before leaving
+//   the critical section therefore still hold after entering it again.
+// - Everything else (the list heads, whether a writer holds or waits for the lock) may have changed and must be read again after entering.
+// - Linking a record and deciding whether it is granted must happen in the same critical section, otherwise a wake-up can be missed.
+// - The conditional functions test their condition again after allocating and delete the record if it no longer holds. Deleting only returns
+//   the record to its free list, so that is safe inside the critical section.
 
 #ifdef RTOS
 
@@ -232,12 +252,25 @@ struct LockRecord
 		: next(p_next), owner(p_owner), count(0) { }
 };
 
+// Get a new lock record for a task. The caller must be in the task critical section.
+// If the free list is empty then this leaves the critical section while it allocates memory, so the caller must read the lock lists again afterwards
+static LockRecord *NewLockRecord(TaskBase *_ecv_from p_owner) noexcept
+{
+	void *_ecv_null p = FreelistManager::TryAllocate<LockRecord>();	// normal case: take a record from the free list, this never calls malloc
+	if (p == nullptr)
+	{
+		// The free list is empty, so we need malloc. Let the scheduler run while we call it, so that malloc takes its mutex and waits
+		// if another task is inside malloc, see the explanation at the start of this section
+		RTOSIface::LeaveTaskCriticalSection();
+		p = FreelistManager::Allocate<LockRecord>();
+		RTOSIface::EnterTaskCriticalSection();						// other tasks may have changed the lock lists by now
+	}
+	return ::new (p) LockRecord(nullptr, p_owner);
+}
+
 void ReadWriteLock::LockForReading() noexcept
 {
 	TaskBase *_ecv_from const me = not_null(TaskBase::GetCallerTaskHandle());
-
-	// Get the lock record before suspending the scheduler, because malloc doesn't take the malloc mutex while the scheduler is suspended
-	LockRecord *const lr = new LockRecord(nullptr, me);
 	RTOSIface::EnterTaskCriticalSection();
 
 	// If we own the write lock, ignore the read lock request
@@ -246,7 +279,6 @@ void ReadWriteLock::LockForReading() noexcept
 		if (wl != nullptr && wl->owner == me)
 		{
 			RTOSIface::LeaveTaskCriticalSection();
-			delete lr;
 			return;
 		}
 	}
@@ -258,12 +290,13 @@ void ReadWriteLock::LockForReading() noexcept
 		{
 			++rl->count;
 			RTOSIface::LeaveTaskCriticalSection();
-			delete lr;
 			return;
 		}
 	}
 
-	// We don't already own a read lock, so we need the new lock record
+	// We don't already own a read lock, so we need a new lock record.
+	// Getting one may leave the critical section, but only this task can add or remove its own records, so the checks above still hold afterwards
+	LockRecord *const lr = NewLockRecord(me);
 	lr->next = readLocks;
 	readLocks = lr;
 
@@ -286,9 +319,6 @@ void ReadWriteLock::LockForReading() noexcept
 bool ReadWriteLock::ConditionalLockForReading() noexcept
 {
 	TaskBase *_ecv_from const me = not_null(TaskBase::GetCallerTaskHandle());
-
-	// Get the lock record before suspending the scheduler, because malloc doesn't take the malloc mutex while the scheduler is suspended
-	LockRecord *const lr = new LockRecord(nullptr, me);
 	RTOSIface::EnterTaskCriticalSection();
 
 	// If we own the write lock, ignore the read lock request
@@ -297,7 +327,6 @@ bool ReadWriteLock::ConditionalLockForReading() noexcept
 		if (wl != nullptr && wl->owner == me)
 		{
 			RTOSIface::LeaveTaskCriticalSection();
-			delete lr;
 			return true;
 		}
 	}
@@ -309,25 +338,28 @@ bool ReadWriteLock::ConditionalLockForReading() noexcept
 		{
 			++readOwner->count;
 			RTOSIface::LeaveTaskCriticalSection();
-			delete lr;
 			return true;
 		}
 	}
 
-	// We don't already own a read lock, so we need the new lock record
+	// We don't already own a read lock, so we need a new lock record
 
 	// If nobody owns or is trying to acquire write lock, we can read lock
 	if (writeLocks == nullptr)
 	{
-		lr->next = readLocks;
-		readLocks = lr;
-		++lr->count;
-		RTOSIface::LeaveTaskCriticalSection();
-		return true;
+		LockRecord *const lr = NewLockRecord(me);
+		if (writeLocks == nullptr)									// test again, getting the record may have left the critical section
+		{
+			lr->next = readLocks;
+			readLocks = lr;
+			lr->count++;
+			RTOSIface::LeaveTaskCriticalSection();
+			return true;
+		}
+		delete lr;													// another task asked for the write lock in the meantime
 	}
 
 	RTOSIface::LeaveTaskCriticalSection();
-	delete lr;
 	return false;
 }
 
@@ -399,9 +431,6 @@ void ReadWriteLock::ReleaseReader() noexcept
 void ReadWriteLock::LockForWriting() noexcept
 {
 	TaskBase *_ecv_from const me = not_null(TaskBase::GetCallerTaskHandle());
-
-	// Get the lock record before suspending the scheduler, because malloc doesn't take the malloc mutex while the scheduler is suspended
-	LockRecord *const newLock = new LockRecord(nullptr, me);
 	RTOSIface::EnterTaskCriticalSection();
 
 	LockRecord *_ecv_null wr = writeLocks;
@@ -411,11 +440,12 @@ void ReadWriteLock::LockForWriting() noexcept
 		++wr->count;
 		++me->writeLocksHeld;
 		RTOSIface::LeaveTaskCriticalSection();
-		delete newLock;
 		return;
 	}
 
-	// We need the new lock record
+	// We need a new lock record
+	LockRecord *newLock = NewLockRecord(me);
+	wr = writeLocks;												// read it again, getting the record may have left the critical section
 	if (wr == nullptr)
 	{
 		// Nobody else is waiting for the write lock, so make the write lock list point to our lock record
@@ -454,23 +484,24 @@ void ReadWriteLock::LockForWriting() noexcept
 bool ReadWriteLock::ConditionalLockForWriting() noexcept
 {
 	TaskBase *_ecv_from const me = not_null(TaskBase::GetCallerTaskHandle());
-
-	// Get the lock record before suspending the scheduler, because malloc doesn't take the malloc mutex while the scheduler is suspended
-	LockRecord *const newLock = new LockRecord(nullptr, me);
 	RTOSIface::EnterTaskCriticalSection();
 
 	if (writeLocks == nullptr && readLocks == nullptr)
 	{
-		// Nobody else is waiting for the write lock and there are no read locks
-		writeLocks = newLock;
-		++newLock->count;
-		++me->writeLocksHeld;
-		RTOSIface::LeaveTaskCriticalSection();
-		return true;
+		LockRecord *newLock = NewLockRecord(me);
+		if (writeLocks == nullptr && readLocks == nullptr)			// test again, getting the record may have left the critical section
+		{
+			// Nobody else is waiting for the write lock and there are no read locks
+			writeLocks = newLock;
+			newLock->count++;
+			++me->writeLocksHeld;
+			RTOSIface::LeaveTaskCriticalSection();
+			return true;
+		}
+		delete newLock;												// another task took a lock in the meantime
 	}
 
 	RTOSIface::LeaveTaskCriticalSection();
-	delete newLock;
 	return false;
 }
 
